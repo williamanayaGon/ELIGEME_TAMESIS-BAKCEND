@@ -1,0 +1,225 @@
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// --- MODELO EPS (ACTUALIZADO) ---
+model Eps {
+  id        Int      @id @default(autoincrement())
+  name      String
+  nit       String?
+  logoUrl   String?
+
+  // CAMPOS DE LOGIN PARA LA EPS
+  adminUser String   @unique
+  adminPass String
+
+  createdAt DateTime @default(now())
+
+  // Relaciones
+  users     User[]
+  patients  Patient[]
+}
+
+// --- MODELO USUARIOS (Cuidadores, Profesionales, Admin Global) ---
+model User {
+  position        String?  // Cargo del profesional (Ej: Médico General, Fisioterapeuta)
+  resumeFile      String?
+  id              Int      @id @default(autoincrement())
+  fullName        String
+  identification  String   @unique
+  email           String   @unique
+  phone           String
+  address         String?
+
+  // Roles: ADMIN, CUIDADOR, PROFESIONAL
+  role            String
+
+  // Estados: PENDIENTE, PRESELECCIONADO, APROBADO, RECHAZADO, ACTIVO
+  status          String   @default("PENDIENTE")
+
+  // Campos específicos de Cuidadores
+  senaCode        String?
+  senaFile        String?  // Ruta del archivo PDF
+  experienceYears String?
+  hasTransport    Boolean  @default(false)
+
+  // Credenciales de acceso (Cuidadores/Profesionales)
+  accessCode      String?  // Código temporal o de acceso
+  password        String?  // Contraseña opcional
+
+  createdAt       DateTime @default(now())
+
+  // 1. DATOS PERSONALES COMPLETOS
+    docType         String?   // CC, CE, PPT
+    birthDate       DateTime?
+
+    // 2. DATOS DEL PACIENTE (Nuevo)
+    patientName     String?
+    patientDoc      String?
+    disabilityGrade String?   // SEVERA, TOTAL, MODERADA
+    hasMedicalOrder String?   // SI, NO
+    diagnosis       String?
+
+    // 3. RELACIÓN Y CUIDADO
+    relationship    String?   // Familiar, Contratista...
+    careType        String?   // Diario, Parcial...
+    startDate       DateTime?
+
+    // 4. SOPORTES DOCUMENTALES (Rutas de archivos)
+    // Reemplaza o complementa senaFile con estos:
+    fileCaregiverId String?
+    filePatientId   String?
+    fileHistory     String?
+    filePower       String?
+    fileTraining    String? // Diploma SENA
+
+  // Relación con EPS (Opcional, si es Admin Global no tiene EPS)
+  epsId           Int?
+  eps             Eps?     @relation(fields: [epsId], references: [id])
+}
+
+// --- MODELO PACIENTES (ACTUALIZADO) ---
+model Patient {
+  id               Int      @id @default(autoincrement())
+  fullName         String
+  age              Int
+  email            String?  // NUEVO: Correo para iniciar sesión
+  accessCode       String?  // NUEVO: Código de 6 dígitos autogenerado
+  stratum          String?
+  diagnosis        String?
+  condition        String?
+  address          String?
+  phone            String?
+
+  careInstructions String?
+  zoneCategory     String?
+  zoneDetail       String?
+  fileHistory      String?
+
+  caregiverId      Int?
+  epsId            Int?
+  eps              Eps? @relation(fields: [epsId], references: [id])
+
+  visits           MedicalVisit[]
+  logs             Log[]
+  requests         ServiceRequest[] // Relación con solicitudes
+  notifications    Notification[]   // Relación con notificaciones
+}
+
+// --- MODELO BITÁCORA (Diario del Cuidador) ---
+model Log {
+  id                 Int       @id @default(autoincrement())
+
+  // JSON con la información didáctica llenada por el cuidador
+  content            String
+  mood               String?
+  alert              Boolean   @default(false)
+  date               DateTime  @default(now())
+
+  // Creador original (Cuidador)
+  caregiverId        Int
+  caregiverName      String?   // Guarda el nombre explícito para rápido acceso
+  caregiverSignature String?   // Firma digital o en texto del cuidador
+
+  // Relación al paciente
+  patientId          Int?
+  patient            Patient?  @relation(fields: [patientId], references: [id])
+
+  // --- NUEVOS CAMPOS PARA EL VISITADOR MÉDICO ---
+  doctorCorrections  String?   // Notas y correcciones agregadas por el médico
+  reviewedByProId    Int?      // ID del Profesional (Visitador) que hace la corrección
+  reviewedAt         DateTime? // Fecha en la que el médico hizo la revisión
+}
+
+// --- MODELO VISITA MÉDICA (Actualizado) ---
+model MedicalVisit {
+  id             Int      @id @default(autoincrement())
+  date           DateTime @default(now())
+  time           String?
+  rating         Int?
+  evalComments   String?
+
+  professionalId Int
+  patientId      Int
+  patient        Patient @relation(fields: [patientId], references: [id])
+
+  formData       String
+
+  // NUEVO: Firma del profesional que realizó la visita
+  signature      String?
+
+  // Relación con las órdenes generadas en esta visita
+  orders         MedicalOrder[]
+}
+// --- MODELO REPORTE FINANCIERO ---
+model FinancialReport {
+  id            Int      @id @default(autoincrement())
+  reference     String   @unique // Ej: RF-2023001
+  date          DateTime @default(now())
+
+  period        String   // "Octubre 2025"
+  epsName       String
+  responsible   String
+
+  // Valores monetarios
+  totalBudget   String
+  totalExecuted String
+  balance       String
+
+  // Detalles de gastos (JSON String)
+  expensesData  String
+
+  generalObs    String?
+  elaboratedBy  String?
+  reviewedBy    String?
+}
+// ==========================================
+// NUEVOS MODELOS PARA LA INTERFAZ PACIENTE
+// ==========================================
+
+model ServiceRequest {
+  id          Int      @id @default(autoincrement())
+  subject     String   // Ej: "Solicitud de Médico", "Cambio de Cuidador"
+  description String
+  status      String   @default("PENDIENTE") // PENDIENTE, EN_PROCESO, RESUELTO
+  createdAt   DateTime @default(now())
+
+  patientId   Int
+  patient     Patient  @relation(fields: [patientId], references: [id])
+}
+
+model Notification {
+  id          Int      @id @default(autoincrement())
+  title       String
+  message     String
+  type        String   @default("INFO") // INFO, RECORDATORIO, ALERTA
+  isRead      Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  patientId   Int
+  patient     Patient  @relation(fields: [patientId], references: [id])
+}
+// ==========================================
+// NUEVO: ÓRDENES MÉDICAS
+// ==========================================
+model MedicalOrder {
+  id               Int      @id @default(autoincrement())
+  orderType        String   // Ej: "MEDICAMENTO", "ESPECIALISTA", "EXAMEN"
+  description      String   // Detalle completo de la orden
+  professionalId   Int      // ID del médico que la emite
+
+  patientId        Int
+
+  visitId          Int
+  visit            MedicalVisit @relation(fields: [visitId], references: [id])
+
+  signature        String?  // Firma digital exclusiva de esta orden
+  createdAt        DateTime @default(now())
+}

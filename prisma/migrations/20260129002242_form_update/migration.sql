@@ -1,0 +1,16 @@
+-- AlterTable
+ALTER TABLE "User" ADD COLUMN     "birthDate" TIMESTAMP(3),
+ADD COLUMN     "careType" TEXT,
+ADD COLUMN     "diagnosis" TEXT,
+ADD COLUMN     "disabilityGrade" TEXT,
+ADD COLUMN     "docType" TEXT,
+ADD COLUMN     "fileCaregiverId" TEXT,
+ADD COLUMN     "fileHistory" TEXT,
+ADD COLUMN     "filePatientId" TEXT,
+ADD COLUMN     "filePower" TEXT,
+ADD COLUMN     "fileTraining" TEXT,
+ADD COLUMN     "hasMedicalOrder" TEXT,
+ADD COLUMN     "patientDoc" TEXT,
+ADD COLUMN     "patientName" TEXT,
+ADD COLUMN     "relationship" TEXT,
+ADD COLUMN     "startDate" TIMESTAMP(3);
