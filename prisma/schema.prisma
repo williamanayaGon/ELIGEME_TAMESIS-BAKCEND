@@ -145,6 +145,10 @@ model Log {
   patientId          Int?
   patient            Patient?  @relation(fields: [patientId], references: [id])
 
+  // Entidad del paciente al momento de escribir. Se copia aquí para poder
+  // acotar por EPS sin depender de que la relación siga intacta.
+  epsId              Int?
+
   // --- NUEVOS CAMPOS PARA EL VISITADOR MÉDICO ---
   doctorCorrections  String?   // Notas y correcciones agregadas por el médico
   reviewedByProId    Int?      // ID del Profesional (Visitador) que hace la corrección
@@ -162,6 +166,9 @@ model MedicalVisit {
   professionalId Int
   patientId      Int
   patient        Patient @relation(fields: [patientId], references: [id])
+
+  // Entidad del paciente al momento de la visita.
+  epsId          Int?
 
   formData       String
 
