@@ -29,8 +29,7 @@ import {
     limiteGeneral,
     registrarEvento
 } from './auth.middleware.js';
-//import furagRoutes from './furag.routes.js';//
-
+//import furagRoutes from './furag.routes.js';/
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
