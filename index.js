@@ -62,10 +62,32 @@ const upload = multer({
 
 // --- Middleware ---
 app.use(helmet());
+
+// Orígenes permitidos. Se normalizan porque una barra final, un espacio o
+// unas comillas de más bastan para que el navegador rechace toda respuesta,
+// y el error que muestra no dice cuál de las tres fue.
+const normalizarOrigen = (valor) =>
+    valor.trim().replace(/^["']|["']$/g, '').replace(/\/+$/, '');
+
+const origenesPermitidos = (process.env.FRONTEND_URL ?? '')
+    .split(',')
+    .map(normalizarOrigen)
+    .filter(Boolean);
+
 app.use(cors({
-    origin: process.env.FRONTEND_URL?.split(',') ?? false,
+    origin(origin, callback) {
+        // Sin cabecera Origin: curl, health checks de Render o el propio servidor.
+        if (!origin) return callback(null, true);
+        callback(null, origenesPermitidos.includes(normalizarOrigen(origin)));
+    },
     credentials: true
 }));
+
+console.log(
+    origenesPermitidos.length
+        ? `🌐 Orígenes permitidos: ${origenesPermitidos.join(', ')}`
+        : '⚠️  FRONTEND_URL no está definida: el navegador bloqueará todas las peticiones.'
+);
 app.use(express.json({ limit: '1mb' }));
 app.use('/api', limiteGeneral);
 
