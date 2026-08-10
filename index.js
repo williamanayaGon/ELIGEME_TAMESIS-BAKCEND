@@ -133,7 +133,7 @@ const openai = new OpenAI({
 // =================================================================
 // ASISTENTE VIRTUAL IA (COMPATIBLE CON CUIDADORES Y PACIENTES)
 // =================================================================
-app.post('/api/ai-assistant', async (req, res) => {
+app.post('/api/ai-assistant', requireAuth, async (req, res) => {
     const { message, userType } = req.body; // userType es opcional ('patient' o 'caregiver')
 
     if (!message) {
@@ -309,7 +309,7 @@ app.post('/api/login', limiteLogin, async (req, res) => {
 // ==========================================
 // RUTA CREAR PACIENTE (CON ENVÍO DE CÓDIGO)
 // ==========================================
-app.post('/api/patients', async (req, res) => {
+app.post('/api/patients', requireAuth, requireRole('ADMIN', 'SUPER'), async (req, res) => {
     console.log("📥 Recibiendo Paciente:", req.body);
 
     try {
@@ -321,7 +321,12 @@ app.post('/api/patients', async (req, res) => {
             identification // Cédula: llave de cruce con las postulaciones
         } = req.body;
 
-        const epsIdInt = parseInt(epsId);
+        // La entidad sale del token. Un admin no puede crear pacientes en otra
+        // EPS mandando otro epsId en el cuerpo; solo un rol global puede elegirla.
+        const epsIdInt = esAlcanceGlobal(req.auth)
+            ? parseInt(epsId, 10)
+            : req.auth.epsId;
+
         const cedula = (identification || '').trim();
 
         // Validamos que envíen el correo
@@ -412,7 +417,7 @@ app.post('/api/visits/evaluation', async (req, res) => {
 // ==========================================
 // 2. CREAR PROFESIONAL (CON CÓDIGO ALEATORIO)
 // ==========================================
-app.post('/api/professionals', async (req, res) => {
+app.post('/api/professionals', requireAuth, requireRole('ADMIN', 'SUPER'), async (req, res) => {
     console.log("CREANDO PROFESIONAL:", req.body);
 
     try {
@@ -470,7 +475,7 @@ app.post('/api/professionals', async (req, res) => {
 });
 
 // Obtener lista de profesionales (FILTRADO POR EPS Y CON PROMEDIO DE ESTRELLAS)
-app.get('/api/professionals', requireAuth, async (req, res) => {
+app.get('/api/professionals', requireAuth, requireRole('ADMIN', 'SUPER'), async (req, res) => {
     // El alcance sale del token, no de la query: el cliente no elige qué EPS ve.
     const where = { role: 'PROFESIONAL', ...alcanceEntidad(req.auth) };
 
@@ -812,7 +817,7 @@ app.post('/api/caregivers', registerUpload, async (req, res) => {
     }
 });
 // Obtener Cuidadores (FILTRADO POR EPS)
-app.get('/api/caregivers', requireAuth, async (req, res) => {
+app.get('/api/caregivers', requireAuth, requireRole('ADMIN', 'SUPER'), async (req, res) => {
     const { epsId, status } = req.query;
 
     // El alcance sale del token, no de la query.
@@ -897,7 +902,7 @@ app.put('/api/caregivers/:id/status', requireAuth, requireRole('ADMIN', 'SUPER')
 });
 
 // Subir Certificado extra
-app.post('/api/upload-certificate/:userId', upload.single('certificate'), async (req, res) => {
+app.post('/api/upload-certificate/:userId', requireAuth, upload.single('certificate'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: "Sin archivo" });
     try {
         await prisma.user.update({
@@ -911,7 +916,7 @@ app.post('/api/upload-certificate/:userId', upload.single('certificate'), async 
 // =================================================================
 // 5. VISITAS MÉDICAS Y ÓRDENES
 // =================================================================
-app.post('/api/visits', async (req, res) => {
+app.post('/api/visits', requireAuth, requireRole('PROFESIONAL', 'ADMIN'), async (req, res) => {
     try {
         // Ahora recibimos la firma y un arreglo opcional de órdenes médicas
         const { professionalId, patientId, formData, signature, medicalOrders } = req.body;
@@ -929,8 +934,8 @@ app.post('/api/visits', async (req, res) => {
                 formData: JSON.stringify(formData),
                 signature: signature || null,
                 time: new Date().toLocaleTimeString(),
-                date: new Date()
-                // La EPS no se duplica aquí: la visita se acota vía patient.epsId.
+                date: new Date(),
+                epsId: paciente.epsId
             }
         });
 
@@ -1002,7 +1007,7 @@ app.get('/api/visits', requireAuth, async (req, res) => {
 // ==========================================
 // CREAR BITÁCORA
 // ==========================================
-app.post('/api/logs', async (req, res) => {
+app.post('/api/logs', requireAuth, requireRole('CUIDADOR', 'ADMIN'), async (req, res) => {
     console.log("📝 Recibiendo nueva bitácora...");
 
     try {
@@ -1034,7 +1039,8 @@ app.post('/api/logs', async (req, res) => {
                 // Extraemos si hay alerta
                 alert: Boolean(formData.alert),
 
-                // La EPS no se duplica aquí: la bitácora se acota vía patient.epsId.
+                epsId: paciente.epsId,
+
                 // 👇 NUEVO: Guardamos la firma digital en la base de datos 👇
                 caregiverSignature: caregiverSignature || null
             }
