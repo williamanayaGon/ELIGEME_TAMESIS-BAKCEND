@@ -14,6 +14,22 @@ function generateAccessCode() {
 // =================================================================
 // CONFIGURACIÓN BÁSICA
 // =================================================================
+
+import crypto from 'crypto';
+import helmet from 'helmet';
+import {
+    requireAuth,
+    requireRole,
+    alcanceEntidad,
+    pacienteEnAlcance,
+    firmarToken,
+    hashearClave,
+    verificarClave,
+    limiteLogin,
+    limiteGeneral,
+    registrarEvento
+} from './auth.middleware.js';
+//import furagRoutes from './furag.routes.js';/
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -24,26 +40,60 @@ const prisma = new PrismaClient();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Configuración de Archivos (Multer)
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, 'uploads/'),
-    filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
+// --- Multer con restricciones ---
+const upload = multer({
+    storage: multer.diskStorage({
+        destination: (req, file, cb) => cb(null, uploadDir),
+        filename: (req, file, cb) => {
+            // Se descarta el nombre original: puede contener rutas o caracteres peligrosos.
+            const ext = path.extname(file.originalname).toLowerCase().slice(0, 10);
+            cb(null, `${Date.now()}-${crypto.randomUUID()}${ext}`);
+        }
+    }),
+    limits: { fileSize: 8 * 1024 * 1024, files: 6 },
+    fileFilter: (req, file, cb) => {
+        const permitidos = ['application/pdf', 'image/jpeg', 'image/png'];
+        if (!permitidos.includes(file.mimetype)) {
+            return cb(new Error('Solo se aceptan archivos PDF, JPG o PNG.'));
+        }
+        cb(null, true);
+    }
 });
-const upload = multer({ storage });
 
-// Middleware
-app.use(cors());
-app.use(express.json());
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+// --- Middleware ---
+app.use(helmet());
+app.use(cors({
+    origin: process.env.FRONTEND_URL?.split(',') ?? false,
+    credentials: true
+}));
+app.use(express.json({ limit: '1mb' }));
+app.use('/api', limiteGeneral);
 
-// Configuración Correo
+// Los soportes documentales quedan detrás de autenticación.
+app.use('/uploads', requireAuth, express.static(uploadDir));
+
+// --- Correo, desde variables de entorno ---
 const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: {
-        user: 'anayawilliam421@gmail.com', //  CORREO
-        pass: 'bjsd rxqk uduf fucb'        // CONTRASEÑA APP
+        user: process.env.MAIL_USER,
+        pass: process.env.MAIL_PASS
     }
 });
+
+// --- Módulo de reportes de gestión ---
+//app.use('/api/furag', furagRoutes);//
+
+// =================================================================
+// AYUDAS DE SALIDA SEGURA
+// =================================================================
+
+// Ni el hash de la clave ni el código de acceso deben salir del servidor.
+const sinCredenciales = ({ password, accessCode, ...resto }) => resto;
+
+// Roles que ven todas las entidades (Superintendencia y admin global).
+const esAlcanceGlobal = (auth) =>
+    auth?.role === 'SUPER' || (auth?.role === 'ADMIN' && auth?.epsId === null);
 
 
 
@@ -110,107 +160,124 @@ console.log("🚀 Iniciando Servidor con Lógica de Separación de EPS...");
 // =================================================================
 // LOGIN UNIFICADO (SUPERINTENDENCIA, ADMIN, EPS, USUARIOS)
 // =================================================================
-app.post('/api/login', async (req, res) => {
-    // Nota: 'credential' recibe la contraseña o el código de acceso
+// ============================================================================
+// B. LOGIN — reemplaza completo el bloque de la línea 113
+//    Cambios: sin accesos maestros embebidos, con bcrypt, con JWT y rate limit.
+// ============================================================================
+
+app.post('/api/login', limiteLogin, async (req, res) => {
     const { email, credential, type } = req.body;
-    console.log("Cuerpo de la petición:", req.body);
-    console.log(`🔑 Intento de login: ${email} - Tipo: ${type || 'PASSWORD'}`);
+
+    if (!email || !credential) {
+        return res.status(400).json({ error: 'Escribe tu correo y tu contraseña.' });
+    }
+
+    // Mensaje único para todos los fallos: no revela si el correo existe.
+    const CREDENCIALES_INVALIDAS = 'El correo o la contraseña no coinciden.';
 
     try {
-    if (type === 'CODE'|| type == 'PASSWORD') {
-                // Buscamos si es un paciente usando su código
-                const patientUser = await prisma.patient.findFirst({
-                    where: { email: email, accessCode: credential }
-                });
+        // ------------------------------------------------------------------
+        // 1. PACIENTE (acceso por código)
+        // ------------------------------------------------------------------
+        if (type === 'CODE') {
+            const paciente = await prisma.patient.findFirst({
+                where: { email },
+                select: { id: true, fullName: true, email: true, accessCode: true, epsId: true }
+            });
 
-                if (patientUser) {
+            if (paciente?.accessCode) {
+                const { valida } = await verificarClave(credential, paciente.accessCode);
+                if (valida) {
+                    await registrarEvento(prisma, { ...req, auth: { id: paciente.id, role: 'PACIENTE', epsId: paciente.epsId } }, {
+                        action: 'LOGIN', entity: 'Patient', entityId: paciente.id
+                    });
                     return res.json({
-                        id: patientUser.id,
-                        role: 'PACIENTE',
-                        name: patientUser.fullName,
-                        email: patientUser.email
+                        token: firmarToken({ id: paciente.id, role: 'PACIENTE', epsId: paciente.epsId }),
+                        user: {
+                            id: paciente.id,
+                            role: 'PACIENTE',
+                            fullName: paciente.fullName,
+                            email: paciente.email,
+                            epsId: paciente.epsId
+                        }
                     });
                 }
             }
-        // ---------------------------------------------------------
-        // 1. SUPERINTENDENCIA (Acceso Hardcoded para Auditoría)
-        // ---------------------------------------------------------
-        if (email === 'super@test.com' && credential === '123') {
-            console.log("✅ Acceso concedido: Superintendencia Nacional de Salud");
+            return res.status(401).json({ error: CREDENCIALES_INVALIDAS });
+        }
+
+        // ------------------------------------------------------------------
+        // 2. ADMINISTRADOR DE ENTIDAD
+        // ------------------------------------------------------------------
+        const cuenta = await prisma.eps.findFirst({ where: { adminUser: email } });
+
+        if (cuenta) {
+            const { valida, necesitaMigracion } = await verificarClave(credential, cuenta.adminPass);
+            if (!valida) return res.status(401).json({ error: CREDENCIALES_INVALIDAS });
+
+            // Rehashea al vuelo las contraseñas heredadas en texto plano.
+            if (necesitaMigracion) {
+                await prisma.eps.update({
+                    where: { id: cuenta.id },
+                    data: { adminPass: await hashearClave(credential) }
+                });
+                console.log(`🔐 Contraseña migrada a hash: entidad ${cuenta.id}`);
+            }
+
             return res.json({
-                id: 999,
-                fullName: 'Superintendencia Nacional de Salud',
-                email: 'super@test.com',
-                role: 'SUPER', // Este rol activa el DashboardSuperintendencia en el Front
-                epsId: null
+                token: firmarToken({ id: cuenta.id, role: 'ADMIN', epsId: cuenta.id }),
+                user: {
+                    id: cuenta.id,
+                    fullName: cuenta.name,
+                    email: cuenta.adminUser,
+                    role: 'ADMIN',
+                    isEps: true,
+                    epsId: cuenta.id
+                }
             });
         }
 
-        // ---------------------------------------------------------
-        // 2. ADMIN GLOBAL (Dueño de la plataforma, ve todo)
-        // ---------------------------------------------------------
-        if (email === 'admin@eps.com' && credential === 'admin123') {
-            return res.json({
-                id: 0,
-                fullName: 'Super Admin',
-                email,
-                role: 'ADMIN',
-                epsId: null
+        // ------------------------------------------------------------------
+        // 3. CUIDADORES Y PROFESIONALES
+        // ------------------------------------------------------------------
+        const user = await prisma.user.findUnique({ where: { email } });
+        if (!user) return res.status(401).json({ error: CREDENCIALES_INVALIDAS });
+
+        if (user.role === 'CUIDADOR' && !['APROBADO', 'PRESELECCIONADO'].includes(user.status)) {
+            return res.status(403).json({ error: 'Tu solicitud sigue en revisión.' });
+        }
+
+        const porClave = await verificarClave(credential, user.password);
+        const porCodigo = await verificarClave(credential, user.accessCode);
+
+        if (!porClave.valida && !porCodigo.valida) {
+            await registrarEvento(prisma, req, {
+                action: 'LOGIN_FALLIDO', entity: 'User', entityId: user.id
+            });
+            return res.status(401).json({ error: CREDENCIALES_INVALIDAS });
+        }
+
+        if (porClave.valida && porClave.necesitaMigracion) {
+            await prisma.user.update({
+                where: { id: user.id },
+                data: { password: await hashearClave(credential) }
             });
         }
 
-        // ---------------------------------------------------------
-        // 3. ADMIN DE EPS (Savia, Sura, Coosalud)
-        // ---------------------------------------------------------
-        const epsAccount = await prisma.eps.findFirst({
-            where: { adminUser: email, adminPass: credential }
+        const { password, accessCode, ...userSeguro } = user;
+
+        await registrarEvento(prisma, { ...req, auth: { id: user.id, role: user.role, epsId: user.epsId } }, {
+            action: 'LOGIN', entity: 'User', entityId: user.id
         });
 
-        if (epsAccount) {
-            console.log(`✅ EPS Logueada: ${epsAccount.name} (ID: ${epsAccount.id})`);
-            return res.json({
-                id: epsAccount.id,
-                fullName: epsAccount.name,
-                email: epsAccount.adminUser,
-                role: 'ADMIN',
-                isEps: true,
-                epsId: epsAccount.id // ESTE ID ES LA CLAVE PARA FILTRAR TODO
-            });
-        }
-
-        // ---------------------------------------------------------
-        // 4. USUARIOS (Cuidadores y Profesionales)
-        // ---------------------------------------------------------
-        const user = await prisma.user.findUnique({ where: { email } });
-
-        if (!user) return res.status(404).json({ error: "Usuario no encontrado" });
-
-        // Validación Estado Cuidador (Solo si es CUIDADOR revisamos si está aprobado/preseleccionado)
-        if (user.role === 'CUIDADOR' && user.status !== 'APROBADO' && user.status !== 'PRESELECCIONADO') {
-            return res.status(403).json({ error: "Tu solicitud sigue en revisión." });
-        }
-
-        // Verificación de credenciales (Password o Código)
-        // A. Login por CÓDIGO (type === 'CODE')
-        const isCodeLogin = type === 'CODE' && user.accessCode === credential;
-
-        // B. Login por CONTRASEÑA (type normal)
-        // Nota: Si el usuario no tiene password seteado, permitimos entrar con accessCode temporalmente si coinciden
-        const isPassLogin = type !== 'CODE' && (user.password === credential || (user.password === '' && user.accessCode === credential));
-
-        if (isCodeLogin || isPassLogin) {
-            return res.json({
-                ...user,
-                epsId: user.epsId // Retornamos la EPS a la que pertenece el usuario
-            });
-        }
-
-        // Si fallan todas las validaciones anteriores
-        return res.status(401).json({ error: "Credenciales incorrectas" });
+        return res.json({
+            token: firmarToken({ id: user.id, role: user.role, epsId: user.epsId }),
+            user: userSeguro
+        });
 
     } catch (error) {
-        console.error("❌ Error login:", error);
-        res.status(500).json({ error: "Error de servidor" });
+        console.error('❌ Error en login:', error);
+        return res.status(500).json({ error: 'No fue posible iniciar sesión. Intenta de nuevo.' });
     }
 });
 
@@ -228,14 +295,23 @@ app.post('/api/patients', async (req, res) => {
             fullName, age, epsId, condition, diagnosis,
             address, phone, stratum, careInstructions,
             zoneCategory, zoneDetail,
-            email // <-- NUEVO CAMPO RECIBIDO DEL FRONTEND
+            email, // <-- NUEVO CAMPO RECIBIDO DEL FRONTEND
+            identification // Cédula: llave de cruce con las postulaciones
         } = req.body;
 
         const epsIdInt = parseInt(epsId);
+        const cedula = (identification || '').trim();
 
         // Validamos que envíen el correo
         if (!fullName || !age || !epsIdInt || !email) {
             return res.status(400).json({ error: "Faltan datos: Nombre, Edad, Correo y EPS son obligatorios." });
+        }
+
+        if (cedula) {
+            const repetida = await prisma.patient.findUnique({ where: { identification: cedula } });
+            if (repetida) {
+                return res.status(400).json({ error: "Ya existe un paciente con esa cédula." });
+            }
         }
 
         // 1. GENERAR CÓDIGO ALEATORIO DE 6 DÍGITOS
@@ -246,6 +322,7 @@ app.post('/api/patients', async (req, res) => {
             data: {
                 fullName,
                 age: parseInt(age),
+                identification: cedula || null,
                 email,            // Guardamos el correo
                 accessCode,       // Guardamos la contraseña temporal
                 condition: condition || diagnosis || "No especificada",
@@ -260,17 +337,11 @@ app.post('/api/patients', async (req, res) => {
             }
         });
 
-        // 3. ENVIAR CORREO (Usa tus credenciales reales aquí)
-        const transporter = nodemailer.createTransport({
-            service: 'gmail', // Cambia si usas otro servicio
-            auth: {
-                  user: 'anayawilliam421@gmail.com', //  CORREO
-                  pass: 'bjsd rxqk uduf fucb'  // Tu contraseña de aplicación
-            }
-        });
-
+        // 3. ENVIAR CORREO
+        // Se reutiliza el transporter global: las credenciales viven en el .env,
+        // nunca en el código.
         const mailOptions = {
-            from: '"Elígeme - Cuidado" <tu_correo@gmail.com>',
+            from: `"Elígeme - Cuidado" <${process.env.MAIL_USER}>`,
             to: email,
             subject: "Tu Código de Acceso - Elígeme",
             html: `
@@ -353,7 +424,7 @@ app.post('/api/professionals', async (req, res) => {
 
         try {
             await transporter.sendMail({
-                from: '"Eligeme Salud" <anayawilliam421@gmail.com>',
+                from: `"Eligeme Salud" <${process.env.MAIL_USER}>`,
                 to: email,
                 subject: '👨‍⚕️ Bienvenido - Tu Acceso',
                 html: `
@@ -377,16 +448,18 @@ app.post('/api/professionals', async (req, res) => {
 });
 
 // Obtener lista de profesionales (FILTRADO POR EPS Y CON PROMEDIO DE ESTRELLAS)
-app.get('/api/professionals', async (req, res) => {
-    const { epsId } = req.query;
-    const where = { role: 'PROFESIONAL' };
+app.get('/api/professionals', requireAuth, async (req, res) => {
+    // El alcance sale del token, no de la query: el cliente no elige qué EPS ve.
+    const where = { role: 'PROFESIONAL', ...alcanceEntidad(req.auth) };
 
-    if (epsId && epsId !== 'null' && epsId !== 'undefined') {
-        where.epsId = parseInt(epsId);
+    // Solo un rol global puede además acotar a una entidad concreta.
+    const { epsId } = req.query;
+    if (esAlcanceGlobal(req.auth) && epsId && epsId !== 'null' && epsId !== 'undefined') {
+        where.epsId = parseInt(epsId, 10);
     }
 
     try {
-        const pros = await prisma.user.findMany({ where });
+        const pros = (await prisma.user.findMany({ where })).map(sinCredenciales);
 
         // Buscamos todas las visitas que tengan calificación
         const evaluatedVisits = await prisma.medicalVisit.findMany({
@@ -416,56 +489,90 @@ app.get('/api/professionals', async (req, res) => {
 // ==========================================
 // OBTENER PACIENTES (COMPLETO: CUIDADOR Y MÉDICO)
 // ==========================================
-app.get('/api/patients', async (req, res) => {
+// ============================================================================
+// C. GET /api/patients
+//    El epsId sale del token, no del query param.
+// ============================================================================
+
+app.get('/api/patients', requireAuth, async (req, res) => {
     try {
-        const { epsId, caregiverId } = req.query;
-        console.log(`🔎 Buscando pacientes. Filtros -> EPS: ${epsId} | Cuidador: ${caregiverId}`);
+        const { role, id, epsId } = req.auth;
+        let where;
 
-        const where = {};
-
-        // 1. Si es EPS o MÉDICO (filtran por EPS)
-        if (epsId && epsId !== 'undefined') {
-            where.epsId = parseInt(epsId);
-        }
-        // 2. Si es CUIDADOR (filtra por asignación)
-        else if (caregiverId && caregiverId !== 'undefined') {
-            where.caregiverId = parseInt(caregiverId);
-        }
-        else {
-            return res.json([]); // Seguridad
+        if (role === 'CUIDADOR') {
+            where = { caregiverId: id };
+        } else if (role === 'PACIENTE') {
+            where = { id };
+        } else if (role === 'SUPER' || (role === 'ADMIN' && epsId === null)) {
+            where = {};
+        } else if (epsId !== null) {
+            where = { epsId };
+        } else {
+            return res.json([]);
         }
 
         const patients = await prisma.patient.findMany({
-            where: where,
-            include: {
-
-                eps: true,      // Información de la EPS
-                visits: true,   // Historial de visitas médicas
-                logs: true      // Bitácoras hechas por el cuidador
-
-            },
+            where,
+            include: { eps: true, visits: true, logs: true },
             orderBy: { id: 'desc' }
         });
 
-        res.json(patients);
+        // El código de acceso no tiene por qué viajar a ninguna interfaz.
+        const limpios = patients.map(({ accessCode, ...p }) => p);
 
+        await registrarEvento(prisma, req, {
+            action: 'LECTURA', entity: 'Patient', detail: { cantidad: limpios.length }
+        });
+
+        res.json(limpios);
     } catch (error) {
-        console.error("❌ Error obteniendo pacientes:", error);
-        res.status(500).json({ error: "Error al cargar pacientes" });
+        console.error('❌ Error obteniendo pacientes:', error);
+        res.status(500).json({ error: 'No se pudieron cargar los pacientes.' });
     }
 });
 
-
-
 // Asignar Cuidador a Paciente
-app.put('/api/patients/:id/assign', async (req, res) => {
+app.put('/api/patients/:id/assign', requireAuth, requireRole('ADMIN', 'SUPER'), async (req, res) => {
     try {
-        await prisma.patient.update({
-            where: { id: parseInt(req.params.id) },
-            data: { caregiverId: parseInt(req.body.caregiverId) }
+        const patientId = parseInt(req.params.id, 10);
+        const caregiverId = parseInt(req.body.caregiverId, 10);
+
+        if (!Number.isInteger(patientId) || !Number.isInteger(caregiverId)) {
+            return res.status(400).json({ error: 'Selecciona un paciente y un cuidador válidos.' });
+        }
+
+        const permitido = await pacienteEnAlcance(prisma, req.auth, patientId);
+        if (!permitido) {
+            return res.status(403).json({ error: 'No tienes acceso a este paciente.' });
+        }
+
+        const cuidador = await prisma.user.findUnique({
+            where: { id: caregiverId },
+            select: { id: true, role: true, status: true, epsId: true }
         });
-        res.json({ message: "Asignado correctamente" });
-    } catch (e) { res.status(500).json({ error: "Error en asignación" }); }
+
+        if (!cuidador || cuidador.role !== 'CUIDADOR') {
+            return res.status(400).json({ error: 'El usuario seleccionado no es un cuidador.' });
+        }
+        if (cuidador.status !== 'APROBADO') {
+            return res.status(400).json({ error: 'El cuidador debe estar aprobado antes de asignarlo.' });
+        }
+
+        await prisma.patient.update({
+            where: { id: patientId },
+            data: { caregiverId, assignedAt: new Date() }
+        });
+
+        await registrarEvento(prisma, req, {
+            action: 'EDICION', entity: 'Patient', entityId: patientId,
+            detail: { asignado: caregiverId }
+        });
+
+        res.json({ message: 'Cuidador asignado.' });
+    } catch (e) {
+        console.error('❌ Error en asignación:', e);
+        res.status(500).json({ error: 'No se pudo completar la asignación.' });
+    }
 });
 
 // ==========================================
@@ -482,6 +589,12 @@ const registerUpload = upload.fields([
     { name: 'docCv', maxCount: 1 }         // Hoja de Vida (Contratista)
 ]);
 
+// Convierte lo que entrega multer en la URL con la que el navegador pedirá el archivo.
+const rutaPublica = (campo) => {
+    const nombre = campo?.[0]?.filename;
+    return nombre ? `/uploads/${nombre}` : null;
+};
+
 // 2. RUTA DE REGISTRO
 app.post('/api/caregivers', registerUpload, async (req, res) => {
     try {
@@ -490,6 +603,13 @@ app.post('/api/caregivers', registerUpload, async (req, res) => {
 
         console.log(`📩 Recibiendo postulación: ${data.fullName} - Tipo: ${data.relationship}`);
 
+        // El formulario viaja como multipart: los booleanos llegan en texto.
+        const requiresHomeCare = data.requiresHomeCare === 'true' || data.requiresHomeCare === true;
+        const isDisabled = data.isDisabled === 'true' || data.isDisabled === true;
+
+        // El formulario envía "Contratista"; se normaliza para no depender del case.
+        const esContratista = String(data.relationship || '').trim().toUpperCase() === 'CONTRATISTA';
+
         // --- LÓGICA DE ESTADO (AUTO-PRESELECCIÓN) ---
         let initialStatus = 'PENDIENTE';
         let generatedCode = null;
@@ -497,7 +617,7 @@ app.post('/api/caregivers', registerUpload, async (req, res) => {
 
         // Solo preseleccionamos si es FAMILIAR y cumple requisitos críticos
         // (Los contratistas siempre pasan a revisión manual)
-        if (data.relationship !== 'CONTRATISTA') {
+        if (!esContratista) {
             const isCritical = (data.disabilityGrade === 'SEVERA' || data.disabilityGrade === 'TOTAL');
             const hasOrder = (data.hasMedicalOrder === 'SI');
 
@@ -506,6 +626,49 @@ app.post('/api/caregivers', registerUpload, async (req, res) => {
                 generatedCode = Math.random().toString(36).substring(2, 8).toUpperCase();
                 userPassword = generatedCode;
             }
+        }
+
+        // --- ASIGNACIÓN AUTOMÁTICA DE PACIENTE ---
+        // Se dispara cuando el postulante declara que el paciente requiere cuidado
+        // en casa Y es discapacitado, Y la cédula que digitó corresponde a un
+        // paciente ya registrado en la misma EPS.
+        const cedulaPaciente = (data.patientDoc || '').trim();
+        const epsIdInt = data.epsId ? parseInt(data.epsId, 10) : null;
+
+        let pacienteAsignado = null;   // paciente que finalmente se asigna
+        let motivoNoAsignado = null;   // por qué no se asignó, para informar a la EPS
+
+        if (!esContratista && requiresHomeCare && isDisabled && cedulaPaciente) {
+            const candidato = await prisma.patient.findUnique({
+                where: { identification: cedulaPaciente },
+                select: { id: true, fullName: true, caregiverId: true, epsId: true }
+            });
+
+            if (!candidato) {
+                motivoNoAsignado = 'NO_ENCONTRADO';
+            } else if (epsIdInt !== null && candidato.epsId !== epsIdInt) {
+                // El paciente existe pero pertenece a otra entidad: lo revisa un humano.
+                motivoNoAsignado = 'OTRA_EPS';
+            } else if (candidato.caregiverId) {
+                // Se respeta el cuidador actual; la postulación pasa a revisión manual.
+                motivoNoAsignado = 'YA_TIENE_CUIDADOR';
+            } else {
+                pacienteAsignado = candidato;
+            }
+        }
+
+        // Un paciente asignado automáticamente implica preselección con credenciales.
+        if (pacienteAsignado) {
+            initialStatus = 'PRESELECCIONADO';
+            if (!generatedCode) {
+                generatedCode = crypto.randomBytes(4).toString('hex').toUpperCase();
+                userPassword = generatedCode;
+            }
+        } else if (motivoNoAsignado === 'YA_TIENE_CUIDADOR') {
+            // Aunque cumpliera los criterios críticos, el conflicto lo decide la EPS.
+            initialStatus = 'PENDIENTE';
+            generatedCode = null;
+            userPassword = null;
         }
 
         // --- CREAR USUARIO EN BD ---
@@ -534,6 +697,10 @@ app.post('/api/caregivers', registerUpload, async (req, res) => {
                 disabilityGrade: data.disabilityGrade || null,
                 hasMedicalOrder: data.hasMedicalOrder || null,
                 diagnosis: data.diagnosis || null,
+                requiresHomeCare,
+                isDisabled,
+                autoAssignedPatientId: pacienteAsignado?.id ?? null,
+                statusChangedAt: new Date(),
 
                 // Relación y Servicio
                 relationship: data.relationship,
@@ -541,15 +708,16 @@ app.post('/api/caregivers', registerUpload, async (req, res) => {
                 startDate: data.startDate ? new Date(data.startDate) : null,
 
                 // --- GUARDADO DE ARCHIVOS EN SUS COLUMNAS CORRECTAS ---
-                // Nota: Usamos el operador ?. para evitar errores si no suben algún archivo
-                fileCaregiverId: files['docCaregiver']?.[0]?.path || null,
-                filePatientId:   files['docPatient']?.[0]?.path || null,
-                fileHistory:     files['docHistory']?.[0]?.path || null,
-                filePower:       files['docPower']?.[0]?.path || null,
-                fileTraining:    files['docTraining']?.[0]?.path || null,
+                // Se guarda la URL pública, no la ruta del disco: file.path es
+                // absoluta ("C:\...") y no sirve para construir el enlace.
+                fileCaregiverId: rutaPublica(files['docCaregiver']),
+                filePatientId:   rutaPublica(files['docPatient']),
+                fileHistory:     rutaPublica(files['docHistory']),
+                filePower:       rutaPublica(files['docPower']),
+                fileTraining:    rutaPublica(files['docTraining']),
 
                 // Usamos el campo senaFile para guardar la HV del contratista si existe
-                senaFile: files['docCv']?.[0]?.path || null,
+                senaFile: rutaPublica(files['docCv']),
 
                 // Credenciales (si aplica)
                 accessCode: generatedCode,
@@ -557,16 +725,44 @@ app.post('/api/caregivers', registerUpload, async (req, res) => {
             }
         });
 
+        // --- VINCULAR EL PACIENTE AL NUEVO CUIDADOR ---
+        // La condición sobre caregiverId evita pisar una asignación que haya
+        // ocurrido entre la consulta anterior y este punto.
+        if (pacienteAsignado) {
+            const vinculo = await prisma.patient.updateMany({
+                where: { id: pacienteAsignado.id, caregiverId: null },
+                data: { caregiverId: newUser.id, assignedAt: new Date() }
+            });
+
+            if (vinculo.count === 0) {
+                // Alguien tomó el paciente primero: se revierte a revisión manual.
+                console.warn(`⚠️ El paciente ${pacienteAsignado.id} ya fue asignado. Postulación ${newUser.id} pasa a PENDIENTE.`);
+                pacienteAsignado = null;
+                motivoNoAsignado = 'YA_TIENE_CUIDADOR';
+                initialStatus = 'PENDIENTE';
+                generatedCode = null;
+
+                await prisma.user.update({
+                    where: { id: newUser.id },
+                    data: { status: 'PENDIENTE', accessCode: null, password: '', autoAssignedPatientId: null }
+                });
+            }
+        }
+
         // --- ENVIAR CORREO DE PRESELECCIÓN (SOLO SI APLICA) ---
         if (initialStatus === 'PRESELECCIONADO' && generatedCode) {
+            const bloquePaciente = pacienteAsignado
+                ? `<p>Se te asignó automáticamente el paciente <strong>${pacienteAsignado.fullName}</strong>, ya que la cédula que registraste corresponde a un paciente de nuestra base.</p>`
+                : '';
             try {
                 await transporter.sendMail({
-                    from: '"Eligeme Salud" <anayawilliam421@gmail.com>',
+                    from: `"Eligeme Salud" <${process.env.MAIL_USER}>`,
                     to: newUser.email,
                     subject: '¡Felicidades! Has sido Preseleccionado',
                     html: `
                         <h2>Hola ${newUser.fullName},</h2>
                         <p>Tu solicitud ha sido aprobada automáticamente por la condición del paciente.</p>
+                        ${bloquePaciente}
                         <div style="background:#eef2ff; padding:15px; border-radius:8px;">
                             <p><strong>Usuario:</strong> ${newUser.email}</p>
                             <p><strong>Código de Acceso:</strong> ${generatedCode}</p>
@@ -576,8 +772,16 @@ app.post('/api/caregivers', registerUpload, async (req, res) => {
             } catch (err) { console.error("Error correo:", err); }
         }
 
-        console.log(`✅ Usuario creado: ${newUser.id} | Estado: ${initialStatus}`);
-        res.json({ message: "Registro exitoso", status: initialStatus });
+        console.log(`✅ Usuario creado: ${newUser.id} | Estado: ${initialStatus}` +
+            (pacienteAsignado ? ` | Paciente auto-asignado: ${pacienteAsignado.id}` : ''));
+
+        res.json({
+            message: "Registro exitoso",
+            status: initialStatus,
+            autoAssigned: Boolean(pacienteAsignado),
+            assignedPatientName: pacienteAsignado?.fullName || null,
+            assignmentIssue: motivoNoAsignado
+        });
 
     } catch (e) {
         console.error("❌ Error en registro:", e);
@@ -586,15 +790,17 @@ app.post('/api/caregivers', registerUpload, async (req, res) => {
     }
 });
 // Obtener Cuidadores (FILTRADO POR EPS)
-app.get('/api/caregivers', async (req, res) => {
+app.get('/api/caregivers', requireAuth, async (req, res) => {
     const { epsId, status } = req.query;
 
-    const where = { role: 'CUIDADOR' };
+    // El alcance sale del token, no de la query.
+    const where = { role: 'CUIDADOR', ...alcanceEntidad(req.auth) };
 
-    // Filtro por EPS
-    if (epsId && epsId !== 'null' && epsId !== 'undefined') {
-        where.epsId = parseInt(epsId);
+    // Solo un rol global puede además acotar a una entidad concreta.
+    if (esAlcanceGlobal(req.auth) && epsId && epsId !== 'null' && epsId !== 'undefined') {
+        where.epsId = parseInt(epsId, 10);
     }
+
     // Filtro por Status (Pendiente, Aprobado, etc.)
     if (status) {
         where.status = status;
@@ -606,40 +812,65 @@ app.get('/api/caregivers', async (req, res) => {
             orderBy: { id: 'desc' },
             include: { eps: true } // Para ver a qué EPS postularon (útil para Super Admin)
         });
-        res.json(users);
+        res.json(users.map(sinCredenciales));
     } catch (error) {
+        console.error('❌ Error obteniendo cuidadores:', error);
         res.status(500).json({ error: "Error obteniendo cuidadores" });
     }
 });
 
 // Cambio de Estado (Aprobar/Preseleccionar)
-app.put('/api/caregivers/:id/status', async (req, res) => {
-    const { id } = req.params; const { status } = req.body;
+app.put('/api/caregivers/:id/status', requireAuth, requireRole('ADMIN', 'SUPER'), async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const { status } = req.body;
+
+    const ESTADOS = ['PENDIENTE', 'PRESELECCIONADO', 'APROBADO', 'RECHAZADO', 'ACTIVO'];
+    if (!ESTADOS.includes(status)) {
+        return res.status(400).json({ error: 'El estado indicado no es válido.' });
+    }
+
     try {
-        const user = await prisma.user.findUnique({ where: { id: parseInt(id) } });
-        if (!user) return res.status(404).json({ error: "No encontrado" });
+        const user = await prisma.user.findUnique({ where: { id } });
+        if (!user) return res.status(404).json({ error: 'No encontramos ese cuidador.' });
 
-        let updateData = { status };
-        let newAccessCode = user.accessCode;
+        // Un admin de entidad no puede tocar cuidadores de otra.
+        if (req.auth.role === 'ADMIN' && req.auth.epsId !== null && user.epsId !== req.auth.epsId) {
+            return res.status(403).json({ error: 'Este cuidador pertenece a otra entidad.' });
+        }
 
-        if (status === 'PRESELECCIONADO' || status === 'APROBADO') {
-            if (!newAccessCode) {
-                newAccessCode = Math.floor(100000 + Math.random() * 900000).toString();
-                updateData.accessCode = newAccessCode;
-            }
-            // Enviar correo
-             await transporter.sendMail({
+        const updateData = { status, statusChangedAt: new Date() };
+        let codigoParaCorreo = null;
+
+        if ((status === 'PRESELECCIONADO' || status === 'APROBADO') && !user.accessCode) {
+            // Código de 8 caracteres con entropía criptográfica, no Math.random.
+            codigoParaCorreo = crypto.randomBytes(4).toString('hex').toUpperCase();
+            updateData.accessCode = await hashearClave(codigoParaCorreo);
+        }
+
+        const updated = await prisma.user.update({ where: { id }, data: updateData });
+
+        if (codigoParaCorreo) {
+            await transporter.sendMail({
                 to: user.email,
-                subject: `🎉 Estado Actualizado: ${status}`,
-                html: `<h2>Tu solicitud ha sido actualizada a ${status}.</h2><p>Tu código de acceso es: <b>${newAccessCode}</b></p>`
+                subject: `Tu solicitud pasó a estado ${status}`,
+                html: `
+                    <p>Hola ${user.fullName},</p>
+                    <p>Tu solicitud en el programa de cuidado domiciliario pasó a estado <b>${status}</b>.</p>
+                    <p>Tu código de acceso es: <b>${codigoParaCorreo}</b></p>
+                    <p>Guárdalo en un lugar seguro. No lo compartas con nadie.</p>
+                `
             });
         }
 
-        const updated = await prisma.user.update({ where: { id: parseInt(id) }, data: updateData });
-        res.json(updated);
+        await registrarEvento(prisma, req, {
+            action: 'EDICION', entity: 'User', entityId: id, detail: { nuevoEstado: status }
+        });
+
+        const { password, accessCode, ...seguro } = updated;
+        res.json(seguro);
     } catch (e) {
-        console.error(e);
-        res.status(500).json({ error: "Error cambiando estado" });
+        console.error('❌ Error cambiando estado:', e);
+        res.status(500).json({ error: 'No se pudo actualizar el estado.' });
     }
 });
 
@@ -662,6 +893,11 @@ app.post('/api/visits', async (req, res) => {
     try {
         // Ahora recibimos la firma y un arreglo opcional de órdenes médicas
         const { professionalId, patientId, formData, signature, medicalOrders } = req.body;
+        const paciente = await prisma.patient.findUnique({
+            where: { id: parseInt(patientId, 10) },
+            select: { epsId: true }
+        });
+        if (!paciente) return res.status(404).json({ error: 'No encontramos ese paciente.' });
 
         // 1. Crear la visita médica con su firma
         const newVisit = await prisma.medicalVisit.create({
@@ -672,6 +908,7 @@ app.post('/api/visits', async (req, res) => {
                 signature: signature || null,
                 time: new Date().toLocaleTimeString(),
                 date: new Date()
+                // La EPS no se duplica aquí: la visita se acota vía patient.epsId.
             }
         });
 
@@ -700,14 +937,45 @@ app.post('/api/visits', async (req, res) => {
     }
 });
 
-// Obtener Visitas
-app.get('/api/visits', async (req, res) => {
-    // Aquí también podrías filtrar por EPS si pasas el patientId o professionalId vinculados
-    const visits = await prisma.medicalVisit.findMany({
-        orderBy: { date: 'desc' },
-        include: { patient: true }
-    });
-    res.json(visits);
+// ============================================================================
+// D. GET /api/visits — reemplaza la línea 704
+//    Antes devolvía TODAS las visitas de TODAS las entidades.
+// ============================================================================
+
+app.get('/api/visits', requireAuth, async (req, res) => {
+    try {
+        const { role, id, epsId } = req.auth;
+        let where = {};
+
+        if (role === 'PROFESIONAL') {
+            where = { professionalId: id };
+        } else if (role === 'CUIDADOR') {
+            where = { patient: { caregiverId: id } };
+        } else if (role === 'PACIENTE') {
+            where = { patientId: id };
+        } else if (role === 'SUPER' || (role === 'ADMIN' && epsId === null)) {
+            where = {};
+        } else if (epsId !== null) {
+            where = { patient: { epsId } };
+        } else {
+            return res.json([]);
+        }
+
+        const visits = await prisma.medicalVisit.findMany({
+            where,
+            orderBy: { date: 'desc' },
+            include: {
+                patient: {
+                    select: { id: true, fullName: true, age: true, diagnosis: true, epsId: true }
+                }
+            }
+        });
+
+        res.json(visits);
+    } catch (error) {
+        console.error('❌ Error obteniendo visitas:', error);
+        res.status(500).json({ error: 'No se pudieron cargar las visitas.' });
+    }
 });
 // ==========================================
 // CREAR BITÁCORA
@@ -723,7 +991,11 @@ app.post('/api/logs', async (req, res) => {
         if (!caregiverId || !patientId || !formData) {
             return res.status(400).json({ error: "Faltan datos obligatorios." });
         }
-
+        const paciente = await prisma.patient.findUnique({
+            where: { id: parseInt(patientId, 10) },
+            select: { epsId: true }
+        });
+        if (!paciente) return res.status(404).json({ error: 'No encontramos ese paciente.' });
         // CREACIÓN EN BASE DE DATOS
         const newLog = await prisma.log.create({
             data: {
@@ -740,6 +1012,7 @@ app.post('/api/logs', async (req, res) => {
                 // Extraemos si hay alerta
                 alert: Boolean(formData.alert),
 
+                // La EPS no se duplica aquí: la bitácora se acota vía patient.epsId.
                 // 👇 NUEVO: Guardamos la firma digital en la base de datos 👇
                 caregiverSignature: caregiverSignature || null
             }
@@ -800,41 +1073,61 @@ app.get('/api/visits/pending-evaluation/:caregiverId', async (req, res) => {
 // =================================================================
 
 // Crear Reporte
-app.post('/api/financial-reports', async (req, res) => {
+
+app.post('/api/financial-reports', requireAuth, requireRole('ADMIN', 'SUPER'), async (req, res) => {
     try {
-        const data = req.body;
+        const d = req.body;
         const ref = `RF-${Date.now().toString().slice(-6)}`;
 
-        const newReport = await prisma.financialReport.create({
+        // El esquema guarda los montos como texto: se normaliza y se devuelve String.
+        const aNumero = (v) => {
+            const n = Number(String(v ?? 0).replace(/[^\d.-]/g, ''));
+            return String(Number.isFinite(n) ? n : 0);
+        };
+
+        const nuevo = await prisma.financialReport.create({
             data: {
                 reference: ref,
-                period: data.period,
-                epsName: data.epsName,
-                responsible: data.responsible,
-                totalBudget: String(data.totalBudget),
-                totalExecuted: String(data.totalExecuted),
-                balance: String(data.balance),
-                expensesData: JSON.stringify(data.expenses),
-                generalObs: data.generalObs,
-                elaboratedBy: data.elaboratedBy,
-                reviewedBy: data.reviewedBy
+                period: d.period,
+                epsName: d.epsName,
+                responsible: d.responsible,
+                totalBudget: aNumero(d.totalBudget),
+                totalExecuted: aNumero(d.totalExecuted),
+                balance: aNumero(d.balance),
+                expensesData: JSON.stringify(d.expenses ?? []),
+                generalObs: d.generalObs,
+                elaboratedBy: d.elaboratedBy,
+                reviewedBy: d.reviewedBy,
+                epsId: req.auth.epsId
             }
         });
-        console.log(`💰 Reporte Financiero: ${ref}`);
-        res.json(newReport);
+
+        await registrarEvento(prisma, req, {
+            action: 'CREACION', entity: 'FinancialReport', entityId: nuevo.id
+        });
+
+        res.json(nuevo);
     } catch (error) {
-        console.error("Error reporte:", error);
-        res.status(500).json({ error: "Error al guardar reporte" });
+        console.error('❌ Error guardando reporte:', error);
+        res.status(500).json({ error: 'No se pudo guardar el reporte.' });
     }
 });
 
-// Obtener Reportes
-app.get('/api/financial-reports', async (req, res) => {
+//Obtener reportes
+app.get('/api/financial-reports', requireAuth, requireRole('ADMIN', 'SUPER'), async (req, res) => {
     try {
-        const reports = await prisma.financialReport.findMany({ orderBy: { date: 'desc' } });
+        const scope = alcanceEntidad(req.auth);
+        const reports = await prisma.financialReport.findMany({
+            where: scope,
+            orderBy: { date: 'desc' }
+        });
         res.json(reports);
-    } catch (error) { res.status(500).json({ error: "Error reportes" }); }
+    } catch (error) {
+        console.error('❌ Error obteniendo reportes:', error);
+        res.status(500).json({ error: 'No se pudieron cargar los reportes.' });
+    }
 });
+
 
 // Lista de EPS (Para el select del formulario público)
 app.get('/api/eps-list', async (req, res) => {
@@ -848,38 +1141,65 @@ app.get('/api/eps-list', async (req, res) => {
 // =================================================================
 // 6. OBTENER BITÁCORAS
 // =================================================================
-app.get('/api/logs', async (req, res) => {
+app.get('/api/logs', requireAuth, async (req, res) => {
     try {
-        const { caregiverId, patientId } = req.query;
+        const { role, id, epsId } = req.auth;
+        const { patientId } = req.query;
 
+        let where = {};
 
-        console.log(`🔎 Buscando historial de bitácoras. Filtros -> Caregiver: ${caregiverId} | Patient: ${patientId}`);
-
-        const where = {};
-
-
-        if (caregiverId && caregiverId !== 'undefined' && caregiverId !== 'null') {
-            where.caregiverId = parseInt(caregiverId);
+        if (role === 'CUIDADOR') {
+            where = { caregiverId: id };
+        } else if (role === 'PACIENTE') {
+            where = { patientId: id };
+        } else if (role === 'SUPER' || (role === 'ADMIN' && epsId === null)) {
+            where = {};
+        } else if (epsId !== null) {
+            where = { patient: { epsId } };
+        } else {
+            return res.json([]);
         }
 
+        // El filtro opcional por paciente se aplica ENCIMA del alcance, nunca en su lugar.
         if (patientId && patientId !== 'undefined' && patientId !== 'null') {
-            where.patientId = parseInt(patientId);
+            const permitido = await pacienteEnAlcance(prisma, req.auth, patientId);
+            if (!permitido) {
+                return res.status(403).json({ error: 'No tienes acceso a este paciente.' });
+            }
+            where.patientId = parseInt(patientId, 10);
         }
 
         const logs = await prisma.log.findMany({
-            where: where,
-            orderBy: { date: 'desc' }, // Las más nuevas primero
+            where,
+            orderBy: { date: 'desc' },
             include: {
-                patient: true
+                patient: { select: { id: true, fullName: true, epsId: true } }
             }
         });
 
         res.json(logs);
-
     } catch (error) {
-        console.error("❌ Error obteniendo historial de bitácoras:", error);
-        res.status(500).json({ error: "Error al cargar el historial de bitácoras" });
+        console.error('❌ Error obteniendo bitácoras:', error);
+        res.status(500).json({ error: 'No se pudo cargar el historial de bitácoras.' });
     }
+});
+// ============================================================================
+// K. MANEJADOR DE ERRORES
+//    Evita que las trazas internas lleguen al navegador.
+// ============================================================================
+
+app.use((err, req, res, next) => {
+    if (err instanceof multer.MulterError) {
+        if (err.code === 'LIMIT_FILE_SIZE') {
+            return res.status(400).json({ error: 'El archivo supera el límite de 8 MB.' });
+        }
+        return res.status(400).json({ error: 'No se pudo procesar el archivo.' });
+    }
+    if (err?.message?.includes('Solo se aceptan archivos')) {
+        return res.status(400).json({ error: err.message });
+    }
+    console.error('❌ Error no controlado:', err);
+    res.status(500).json({ error: 'Ocurrió un error inesperado. Intenta de nuevo.' });
 });
 // =================================================================
 // INICIO SERVIDOR
