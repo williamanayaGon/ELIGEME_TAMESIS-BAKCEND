@@ -67,6 +67,15 @@ model User {
     hasMedicalOrder String?   // SI, NO
     diagnosis       String?
 
+    // Declaración del postulante sobre la condición del paciente.
+    // Junto con la coincidencia de cédula, disparan la asignación automática.
+    requiresHomeCare Boolean  @default(false)
+    isDisabled       Boolean  @default(false)
+
+    // Paciente que el sistema asignó automáticamente al aprobar la postulación.
+    autoAssignedPatientId Int?
+    statusChangedAt       DateTime?
+
     // 3. RELACIÓN Y CUIDADO
     relationship    String?   // Familiar, Contratista...
     careType        String?   // Diario, Parcial...
@@ -90,6 +99,9 @@ model Patient {
   id               Int      @id @default(autoincrement())
   fullName         String
   age              Int
+  // Cédula del paciente. Es la llave con la que se compara la que digita el
+  // postulante para decidir la asignación automática.
+  identification   String?  @unique
   email            String?  // NUEVO: Correo para iniciar sesión
   accessCode       String?  // NUEVO: Código de 6 dígitos autogenerado
   stratum          String?
@@ -104,6 +116,7 @@ model Patient {
   fileHistory      String?
 
   caregiverId      Int?
+  assignedAt       DateTime?
   epsId            Int?
   eps              Eps? @relation(fields: [epsId], references: [id])
 
@@ -179,6 +192,9 @@ model FinancialReport {
   generalObs    String?
   elaboratedBy  String?
   reviewedBy    String?
+
+  // Entidad dueña del reporte: acota qué ve cada admin.
+  epsId         Int?
 }
 // ==========================================
 // NUEVOS MODELOS PARA LA INTERFAZ PACIENTE
