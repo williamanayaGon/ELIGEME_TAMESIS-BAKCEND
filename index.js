@@ -29,6 +29,7 @@ import {
     limiteGeneral,
     registrarEvento
 } from './auth.middleware.js';
+import crearRutasFinancieras from './financial.routes.js';
 //import furagRoutes from './furag.routes.js';/
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1102,59 +1103,9 @@ app.get('/api/visits/pending-evaluation/:caregiverId', async (req, res) => {
 
 // Crear Reporte
 
-app.post('/api/financial-reports', requireAuth, requireRole('ADMIN', 'SUPER'), async (req, res) => {
-    try {
-        const d = req.body;
-        const ref = `RF-${Date.now().toString().slice(-6)}`;
-
-        // El esquema guarda los montos como texto: se normaliza y se devuelve String.
-        const aNumero = (v) => {
-            const n = Number(String(v ?? 0).replace(/[^\d.-]/g, ''));
-            return String(Number.isFinite(n) ? n : 0);
-        };
-
-        const nuevo = await prisma.financialReport.create({
-            data: {
-                reference: ref,
-                period: d.period,
-                epsName: d.epsName,
-                responsible: d.responsible,
-                totalBudget: aNumero(d.totalBudget),
-                totalExecuted: aNumero(d.totalExecuted),
-                balance: aNumero(d.balance),
-                expensesData: JSON.stringify(d.expenses ?? []),
-                generalObs: d.generalObs,
-                elaboratedBy: d.elaboratedBy,
-                reviewedBy: d.reviewedBy,
-                epsId: req.auth.epsId
-            }
-        });
-
-        await registrarEvento(prisma, req, {
-            action: 'CREACION', entity: 'FinancialReport', entityId: nuevo.id
-        });
-
-        res.json(nuevo);
-    } catch (error) {
-        console.error('❌ Error guardando reporte:', error);
-        res.status(500).json({ error: 'No se pudo guardar el reporte.' });
-    }
-});
-
-//Obtener reportes
-app.get('/api/financial-reports', requireAuth, requireRole('ADMIN', 'SUPER'), async (req, res) => {
-    try {
-        const scope = alcanceEntidad(req.auth);
-        const reports = await prisma.financialReport.findMany({
-            where: scope,
-            orderBy: { date: 'desc' }
-        });
-        res.json(reports);
-    } catch (error) {
-        console.error('❌ Error obteniendo reportes:', error);
-        res.status(500).json({ error: 'No se pudieron cargar los reportes.' });
-    }
-});
+// El módulo completo (listado con filtros, líneas de gasto, envío,
+// exportación e importación) vive en financial.routes.js.
+app.use('/api/financial-reports', crearRutasFinancieras(prisma));
 
 
 // Lista de EPS (Para el select del formulario público)
