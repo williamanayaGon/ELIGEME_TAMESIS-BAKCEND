@@ -14,7 +14,7 @@ async function main() {
 
   // 2. Crear las EPS
   const epsList = [
-    { name: 'EPS Sura', adminUser: 'admin@sura', adminPass: 'sura123' },
+    { name: 'Hospital', adminUser: 'admin@sura', adminPass: 'sura123' },
     { name: 'Savia Salud', adminUser: 'savi', adminPass: 'savi123' },
     { name: 'Coosalud', adminUser: 'coosalud', adminPass: 'coosalud123' }
   ];
