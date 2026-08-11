@@ -31,6 +31,7 @@ import {
 } from './auth.middleware.js';
 import crearRutasFinancieras from './financial.routes.js';
 import crearRutasFurag from './furag.routes.js';
+import crearRutasPrograma from './programa.routes.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -106,6 +107,9 @@ const transporter = nodemailer.createTransport({
 
 // --- Módulo de reportes de gestión ---
 app.use('/api/furag', crearRutasFurag(prisma));
+
+// --- Caracterización de la población atendida ---
+app.use('/api/programa', crearRutasPrograma(prisma));
 
 // =================================================================
 // AYUDAS DE SALIDA SEGURA
