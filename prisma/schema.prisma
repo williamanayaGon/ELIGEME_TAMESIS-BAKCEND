@@ -123,6 +123,11 @@ model Patient {
   // como "Sin registrar", nunca como cero.
   createdAt        DateTime?
 
+  // Permanencia en el programa: ACTIVO | EGRESADO
+  programStatus    String    @default("ACTIVO")
+  egresadoAt       DateTime?
+  motivoEgreso     String?
+
   epsId            Int?
   eps              Eps? @relation(fields: [epsId], references: [id])
 
@@ -309,6 +314,26 @@ model ImprovementAction {
   updatedAt     DateTime @updatedAt
 
   @@index([estado, fechaObjetivo])
+  @@index([epsId])
+}
+
+// Parámetros que fija la entidad, no el sistema.
+//
+// El caso que motiva el modelo: el umbral de días para considerar que alguien
+// "no registra seguimiento reciente". Un 60 hardcodeado sería un criterio
+// inventado por la plataforma; aquí lo decide la entidad y queda guardado
+// junto a la razón por la que lo eligió, para que el dato sea defendible.
+model ProgramSetting {
+  id           Int      @id @default(autoincrement())
+  clave        String
+  valor        String
+  justificacion String
+  definidoPor  Int?
+  epsId        Int?
+  updatedAt    DateTime @updatedAt
+  createdAt    DateTime @default(now())
+
+  @@unique([clave, epsId])
   @@index([epsId])
 }
 
