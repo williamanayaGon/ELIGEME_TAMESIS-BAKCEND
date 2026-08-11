@@ -30,7 +30,7 @@ import {
     registrarEvento
 } from './auth.middleware.js';
 import crearRutasFinancieras from './financial.routes.js';
-//import furagRoutes from './furag.routes.js';/
+import crearRutasFurag from './furag.routes.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -105,7 +105,7 @@ const transporter = nodemailer.createTransport({
 });
 
 // --- Módulo de reportes de gestión ---
-//app.use('/api/furag', furagRoutes);//
+app.use('/api/furag', crearRutasFurag(prisma));
 
 // =================================================================
 // AYUDAS DE SALIDA SEGURA
@@ -351,6 +351,7 @@ app.post('/api/patients', requireAuth, requireRole('ADMIN', 'SUPER'), async (req
                 fullName,
                 age: parseInt(age),
                 identification: cedula || null,
+                createdAt: new Date(), // Base de los indicadores por periodo
                 email,            // Guardamos el correo
                 accessCode,       // Guardamos la contraseña temporal
                 condition: condition || diagnosis || "No especificada",
@@ -600,6 +601,125 @@ app.put('/api/patients/:id/assign', requireAuth, requireRole('ADMIN', 'SUPER'), 
     } catch (e) {
         console.error('❌ Error en asignación:', e);
         res.status(500).json({ error: 'No se pudo completar la asignación.' });
+    }
+});
+
+// ==========================================
+// SOLICITUDES CIUDADANAS
+// ==========================================
+// El sello resolvedAt es lo que permite medir el tiempo de respuesta que
+// reporta el indicador de solicitudes ciudadanas del módulo FURAG.
+
+const ESTADOS_SOLICITUD = ['PENDIENTE', 'EN_PROCESO', 'RESUELTO'];
+
+// Listar. Cada rol ve el subconjunto que le corresponde.
+app.get('/api/service-requests', requireAuth, async (req, res) => {
+    try {
+        const { role, id, epsId } = req.auth;
+        let where;
+
+        if (role === 'PACIENTE') where = { patientId: id };
+        else if (role === 'CUIDADOR') where = { patient: { caregiverId: id } };
+        else if (esAlcanceGlobal(req.auth)) where = {};
+        else if (epsId !== null) where = { patient: { epsId } };
+        else return res.json([]);
+
+        const { estado } = req.query;
+        if (estado && ESTADOS_SOLICITUD.includes(estado)) where.status = estado;
+
+        const solicitudes = await prisma.serviceRequest.findMany({
+            where,
+            orderBy: { createdAt: 'desc' },
+            include: { patient: { select: { id: true, fullName: true, epsId: true } } }
+        });
+
+        res.json(solicitudes);
+    } catch (error) {
+        console.error('❌ Error obteniendo solicitudes:', error);
+        res.status(500).json({ error: 'No se pudieron cargar las solicitudes.' });
+    }
+});
+
+// Radicar. Un paciente radica la suya; un admin puede hacerlo por él.
+app.post('/api/service-requests', requireAuth, async (req, res) => {
+    try {
+        const { subject, description } = req.body;
+
+        if (!subject?.trim() || !description?.trim()) {
+            return res.status(400).json({ error: 'Escribe el asunto y la descripción de la solicitud.' });
+        }
+
+        // Un paciente solo radica para sí mismo: el id del cuerpo se ignora.
+        const patientId = req.auth.role === 'PACIENTE'
+            ? req.auth.id
+            : parseInt(req.body.patientId, 10);
+
+        if (!Number.isInteger(patientId)) {
+            return res.status(400).json({ error: 'Indica el paciente de la solicitud.' });
+        }
+
+        const permitido = await pacienteEnAlcance(prisma, req.auth, patientId);
+        if (!permitido) {
+            return res.status(403).json({ error: 'No tienes acceso a ese paciente.' });
+        }
+
+        const creada = await prisma.serviceRequest.create({
+            data: {
+                subject: subject.trim(),
+                description: description.trim(),
+                status: 'PENDIENTE',
+                patientId
+            }
+        });
+
+        await registrarEvento(prisma, req, {
+            action: 'CREACION', entity: 'ServiceRequest', entityId: creada.id
+        });
+
+        res.status(201).json(creada);
+    } catch (error) {
+        console.error('❌ Error radicando solicitud:', error);
+        res.status(500).json({ error: 'No se pudo radicar la solicitud.' });
+    }
+});
+
+// Cambiar el estado. Solo la entidad resuelve.
+app.put('/api/service-requests/:id/status', requireAuth, requireRole('ADMIN', 'SUPER'), async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (!Number.isInteger(id)) return res.status(400).json({ error: 'Identificador inválido.' });
+
+        const { status } = req.body;
+        if (!ESTADOS_SOLICITUD.includes(status)) {
+            return res.status(400).json({ error: 'El estado indicado no es válido.' });
+        }
+
+        const solicitud = await prisma.serviceRequest.findUnique({ where: { id } });
+        if (!solicitud) return res.status(404).json({ error: 'No encontramos esa solicitud.' });
+
+        const permitido = await pacienteEnAlcance(prisma, req.auth, solicitud.patientId);
+        if (!permitido) {
+            return res.status(403).json({ error: 'Esa solicitud pertenece a otra entidad.' });
+        }
+
+        // Se sella al resolver y se limpia si se reabre: así el tiempo de
+        // respuesta siempre corresponde a la resolución vigente.
+        const actualizada = await prisma.serviceRequest.update({
+            where: { id },
+            data: {
+                status,
+                resolvedAt: status === 'RESUELTO' ? (solicitud.resolvedAt ?? new Date()) : null
+            }
+        });
+
+        await registrarEvento(prisma, req, {
+            action: 'EDICION', entity: 'ServiceRequest', entityId: id, detail: { status }
+        });
+
+        res.json(actualizada);
+    } catch (error) {
+        console.error('❌ Error actualizando solicitud:', error);
+        res.status(500).json({ error: 'No se pudo actualizar la solicitud.' });
     }
 });
 

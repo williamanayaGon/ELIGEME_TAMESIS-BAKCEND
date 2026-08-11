@@ -117,6 +117,12 @@ model Patient {
 
   caregiverId      Int?
   assignedAt       DateTime?
+
+  // Anulable a propósito: los pacientes anteriores a este campo no tienen
+  // fecha de registro y no se puede inventar. Los indicadores los reportan
+  // como "Sin registrar", nunca como cero.
+  createdAt        DateTime?
+
   epsId            Int?
   eps              Eps? @relation(fields: [epsId], references: [id])
 
@@ -244,6 +250,87 @@ model FinancialReport {
   @@index([estado])
 }
 
+// ==========================================
+// EVIDENCIA FURAG / MIPG
+// ==========================================
+// Este módulo NO calcula el Índice de Desempeño Institucional ni replica el
+// formulario oficial: organiza la actividad real del programa como soporte
+// documental para quien responde el formulario ante Función Pública.
+
+model FuragEvidence {
+  id             Int      @id @default(autoincrement())
+
+  politica       String   // Política MIPG que respalda
+  nombre         String
+  descripcion    String?
+
+  // GENERADA  -> producida por ELÍGEME desde sus indicadores
+  // CARGADA   -> archivo subido por un funcionario
+  origen         String
+
+  // Solo para GENERADA: id del indicador del catálogo que la alimenta
+  indicadorId    String?
+  periodoInicio  DateTime?
+  periodoFin     DateTime?
+  // Snapshot del valor al momento de generarla, para que el documento no cambie después
+  valorGenerado  Json?
+
+  archivoUrl     String?
+  responsable    String?
+  dependencia    String?
+  fechaDocumento DateTime?
+  vigenteHasta   DateTime?
+  observaciones  String?
+
+  generadaPor    Int?
+  epsId          Int?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([politica])
+  @@index([vigenteHasta])
+  @@index([epsId])
+}
+
+model ImprovementAction {
+  id            Int      @id @default(autoincrement())
+  politica      String
+  brecha        String       // La describe el funcionario, no la infiere el sistema
+  accion        String
+  responsable   String
+  dependencia   String
+  fechaInicio   DateTime?
+  fechaObjetivo DateTime
+  avance        Int      @default(0)   // 0 a 100, lo actualiza el responsable
+  // PENDIENTE | EN_CURSO | COMPLETADA | VENCIDA
+  estado        String   @default("PENDIENTE")
+  epsId         Int?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([estado, fechaObjetivo])
+  @@index([epsId])
+}
+
+// Rastro de quién hizo qué. Alimenta el indicador de eventos de acceso.
+model AuditEvent {
+  id        Int      @id @default(autoincrement())
+  action    String   // LOGIN, LECTURA, CREACION, EDICION, ENVIO...
+  entity    String
+  entityId  Int?
+  detail    Json?
+
+  actorId   Int?
+  actorRole String?
+  epsId     Int?
+
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([epsId])
+  @@index([action])
+}
+
 model FinancialLineItem {
   id            Int      @id @default(autoincrement())
   reportId      Int
@@ -283,6 +370,7 @@ model ServiceRequest {
   description String
   status      String   @default("PENDIENTE") // PENDIENTE, EN_PROCESO, RESUELTO
   createdAt   DateTime @default(now())
+  resolvedAt  DateTime? // Se sella al pasar a RESUELTO; mide el tiempo de respuesta
 
   patientId   Int
   patient     Patient  @relation(fields: [patientId], references: [id])
