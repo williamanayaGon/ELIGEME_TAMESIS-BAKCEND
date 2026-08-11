@@ -124,6 +124,7 @@ model Patient {
   logs             Log[]
   requests         ServiceRequest[] // Relación con solicitudes
   notifications    Notification[]   // Relación con notificaciones
+  lineItems        FinancialLineItem[] // Gastos trazados a este paciente
 }
 
 // --- MODELO BITÁCORA (Diario del Cuidador) ---
@@ -179,6 +180,24 @@ model MedicalVisit {
   orders         MedicalOrder[]
 }
 // --- MODELO REPORTE FINANCIERO ---
+
+enum TipoReporte {
+  GENERAL           // Ejecución presupuestal consolidada
+  TRASLADOS         // Transporte asistencial de pacientes
+  MEDICAMENTOS      // Suministro de medicamentos
+  INSUMOS           // Insumos médicos y de cuidado
+  TALENTO_HUMANO    // Honorarios de cuidadores y profesionales
+  AYUDAS_TECNICAS   // Sillas, camas, oxígeno, andadores
+  URGENCIAS         // Atenciones de urgencia y hospitalizaciones
+}
+
+enum EstadoReporte {
+  BORRADOR
+  ENVIADO
+  APROBADO
+  OBJETADO
+}
+
 model FinancialReport {
   id            Int      @id @default(autoincrement())
   reference     String   @unique // Ej: RF-2023001
@@ -193,7 +212,8 @@ model FinancialReport {
   totalExecuted String
   balance       String
 
-  // Detalles de gastos (JSON String)
+  // Detalles de gastos (JSON String). Heredado: se conserva para no perder
+  // los reportes viejos mientras se migran a líneas.
   expensesData  String
 
   generalObs    String?
@@ -202,6 +222,56 @@ model FinancialReport {
 
   // Entidad dueña del reporte: acota qué ve cada admin.
   epsId         Int?
+
+  // --- Clasificación y ciclo de vida ---
+  reportType    TipoReporte   @default(GENERAL)
+  estado        EstadoReporte @default(BORRADOR)
+
+  periodoInicio DateTime
+  periodoFin    DateTime
+  enviadoAt     DateTime?
+
+  // Un reporte ENVIADO es inmutable; corregirlo exige uno nuevo que
+  // referencie al anterior.
+  corrigeId     Int?
+  corrige       FinancialReport?  @relation("Correcciones", fields: [corrigeId], references: [id])
+  correcciones  FinancialReport[] @relation("Correcciones")
+
+  items         FinancialLineItem[]
+
+  @@index([epsId])
+  @@index([reportType])
+  @@index([estado])
+}
+
+model FinancialLineItem {
+  id            Int      @id @default(autoincrement())
+  reportId      Int
+  report        FinancialReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  concepto      String
+  descripcion   String?
+  cantidad      Decimal  @default(1) @db.Decimal(12, 2)
+  valorUnitario Decimal  @db.Decimal(15, 2)
+  valorTotal    Decimal  @db.Decimal(15, 2)
+
+  fechaEvento   DateTime?
+
+  // Trazabilidad opcional al paciente. Solo en reportes dirigidos a la EPS que ya
+  // es responsable de ese paciente.
+  patientId     Int?
+  patient       Patient? @relation(fields: [patientId], references: [id])
+  visitId       Int?
+
+  // TRASLADOS: origen, destino, kilómetros, tipo de vehículo
+  // MEDICAMENTOS: código CUM, principio activo, presentación
+  metadata      Json?
+
+  createdAt     DateTime @default(now())
+
+  @@index([reportId])
+  @@index([patientId])
+  @@index([fechaEvento])
 }
 // ==========================================
 // NUEVOS MODELOS PARA LA INTERFAZ PACIENTE
