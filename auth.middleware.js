@@ -199,29 +199,31 @@ export const limiteGeneral = rateLimit({
 // -----------------------------------------------------------------
 
 /**
- * Registra quién hizo qué.
+ * Registra quién hizo qué en la tabla AuditEvent.
  *
- * NOTA: todavía no existe un modelo de auditoría en schema.prisma, así
- * que por ahora el rastro queda en la salida del servidor. El día que se
- * agregue el modelo, basta con reemplazar el console.log por el insert.
+ * Alimenta además el indicador de eventos de acceso del módulo FURAG.
  *
- * Nunca lanza: una falla de auditoría no debe tumbar la petición.
+ * Nunca lanza: una falla de auditoría no debe tumbar la petición que la
+ * originó. Si el insert falla, queda el rastro en la salida del servidor.
  */
 export async function registrarEvento(prisma, req, { action, entity, entityId = null, detail = null }) {
     try {
-        const quien = req?.auth
-            ? `${req.auth.role}#${req.auth.id}${req.auth.epsId !== null ? ` (eps ${req.auth.epsId})` : ''}`
-            : 'anónimo';
-
-        const partes = [
-            `🧾 [AUDIT] ${action}`,
-            `${entity}${entityId !== null ? `#${entityId}` : ''}`,
-            `por ${quien}`
-        ];
-        if (detail) partes.push(JSON.stringify(detail));
-
-        console.log(partes.join(' | '));
+        await prisma.auditEvent.create({
+            data: {
+                action,
+                entity,
+                entityId,
+                detail: detail ?? undefined,
+                actorId: req?.auth?.id ?? null,
+                actorRole: req?.auth?.role ?? null,
+                epsId: req?.auth?.epsId ?? null
+            }
+        });
     } catch (e) {
-        console.error('No se pudo registrar el evento de auditoría:', e.message);
+        const quien = req?.auth ? `${req.auth.role}#${req.auth.id}` : 'anónimo';
+        console.error(
+            `No se pudo registrar la auditoría (${action} ${entity} por ${quien}):`,
+            e.message
+        );
     }
 }
