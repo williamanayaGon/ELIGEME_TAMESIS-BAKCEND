@@ -97,12 +97,26 @@ app.use('/api', limiteGeneral);
 app.use('/uploads', requireAuth, express.static(uploadDir));
 
 // --- Correo, desde variables de entorno ---
+//
+// Los tiempos de espera son obligatorios aquí, no un detalle de afinación.
+// Render bloquea el tráfico saliente a los puertos SMTP (25, 465 y 587) en
+// los planes web gratuitos desde el 26 de septiembre de 2025. La conexión no
+// se rechaza: se queda colgada. Sin límite explícito, nodemailer espera
+// minutos, la respuesta HTTP nunca sale, el operador cree que falló, vuelve a
+// darle a "crear" y quedan registros duplicados.
+//
+// Con estos límites el envío falla en unos ocho segundos y quien llama puede
+// decidir qué hacer. La entrega real necesita un proveedor por HTTPS o un
+// plan de pago en Render; esto solo acota el daño.
 const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: {
         user: process.env.MAIL_USER,
         pass: process.env.MAIL_PASS
-    }
+    },
+    connectionTimeout: 8000,
+    greetingTimeout: 5000,
+    socketTimeout: 8000
 });
 
 // --- Módulo de reportes de gestión ---
@@ -1044,17 +1058,29 @@ app.put('/api/caregivers/:id/status', requireAuth, requireRole('ADMIN', 'SUPER')
 
         const updated = await prisma.user.update({ where: { id }, data: updateData });
 
+        // El estado YA quedó guardado. Si el correo falla y dejamos que la
+        // excepción suba, la respuesta es 500 y el panel dice que no se pudo
+        // aprobar, cuando sí se aprobó. Peor: el código se guarda hasheado, así
+        // que si no sale por correo no queda forma de recuperarlo y ese
+        // cuidador no puede entrar nunca. Por eso se devuelve al panel.
+        let correoEnviado = null;
         if (codigoParaCorreo) {
-            await transporter.sendMail({
-                to: user.email,
-                subject: `Tu solicitud pasó a estado ${status}`,
-                html: `
-                    <p>Hola ${user.fullName},</p>
-                    <p>Tu solicitud en el programa de cuidado domiciliario pasó a estado <b>${status}</b>.</p>
-                    <p>Tu código de acceso es: <b>${codigoParaCorreo}</b></p>
-                    <p>Guárdalo en un lugar seguro. No lo compartas con nadie.</p>
-                `
-            });
+            correoEnviado = false;
+            try {
+                await transporter.sendMail({
+                    to: user.email,
+                    subject: `Tu solicitud pasó a estado ${status}`,
+                    html: `
+                        <p>Hola ${user.fullName},</p>
+                        <p>Tu solicitud en el programa de cuidado domiciliario pasó a estado <b>${status}</b>.</p>
+                        <p>Tu código de acceso es: <b>${codigoParaCorreo}</b></p>
+                        <p>Guárdalo en un lugar seguro. No lo compartas con nadie.</p>
+                    `
+                });
+                correoEnviado = true;
+            } catch (errorCorreo) {
+                console.error(`⚠️ Cuidador ${id} pasó a ${status}, pero el correo a ${user.email} falló:`, errorCorreo.message);
+            }
         }
 
         await registrarEvento(prisma, req, {
@@ -1062,7 +1088,11 @@ app.put('/api/caregivers/:id/status', requireAuth, requireRole('ADMIN', 'SUPER')
         });
 
         const { password, accessCode, ...seguro } = updated;
-        res.json(seguro);
+        res.json({
+            ...seguro,
+            correoEnviado,
+            codigoParaEntregar: correoEnviado === false ? codigoParaCorreo : undefined
+        });
     } catch (e) {
         console.error('❌ Error cambiando estado:', e);
         res.status(500).json({ error: 'No se pudo actualizar el estado.' });
