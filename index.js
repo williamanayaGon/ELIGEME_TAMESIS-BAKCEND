@@ -207,12 +207,19 @@ app.post('/api/login', limiteLogin, async (req, res) => {
         // 1. PACIENTE (acceso por código)
         // ------------------------------------------------------------------
         if (type === 'CODE') {
-            const paciente = await prisma.patient.findFirst({
+            // El correo NO es único en Patient: la base tiene varias filas con
+            // el mismo correo. Con findFirst el login resolvía siempre al
+            // paciente más antiguo, así que el código de cualquier registro
+            // posterior daba 401 aunque fuera correcto. Se prueban todos y se
+            // entra al que corresponda al código presentado.
+            const candidatos = await prisma.patient.findMany({
                 where: { email },
-                select: { id: true, fullName: true, email: true, accessCode: true, epsId: true }
+                select: { id: true, fullName: true, email: true, accessCode: true, epsId: true },
+                orderBy: { id: 'desc' }
             });
 
-            if (paciente?.accessCode) {
+            for (const paciente of candidatos) {
+                if (!paciente.accessCode) continue;
                 const { valida } = await verificarClave(credential, paciente.accessCode);
                 if (valida) {
                     await registrarEvento(prisma, { ...req, auth: { id: paciente.id, role: 'PACIENTE', epsId: paciente.epsId } }, {
@@ -339,6 +346,24 @@ app.post('/api/patients', requireAuth, requireRole('ADMIN', 'SUPER'), async (req
             return res.status(400).json({ error: "Faltan datos: Nombre, Edad, Correo y EPS son obligatorios." });
         }
 
+        const correo = String(email).trim().toLowerCase();
+
+        // El correo es la llave con la que el paciente entra. Un dedazo aquí
+        // ('.con' por '.com') crea un paciente que jamás podrá acceder: el
+        // código sale hacia una dirección que rebota y nadie se entera.
+        if (!/^[^\s@]+@[^\s@]+\.[a-z]{2,}$/i.test(correo)) {
+            return res.status(400).json({ error: "El correo no tiene un formato válido. Revísalo: es la llave con la que el paciente entra." });
+        }
+
+        // Sin esto se acumulan pacientes distintos con el mismo correo y el
+        // acceso se vuelve ambiguo.
+        const correoRepetido = await prisma.patient.findFirst({ where: { email: correo } });
+        if (correoRepetido) {
+            return res.status(400).json({
+                error: `Ya hay un paciente registrado con ese correo (${correoRepetido.fullName}). Usa un correo distinto para cada paciente.`
+            });
+        }
+
         if (cedula) {
             const repetida = await prisma.patient.findUnique({ where: { identification: cedula } });
             if (repetida) {
@@ -356,7 +381,7 @@ app.post('/api/patients', requireAuth, requireRole('ADMIN', 'SUPER'), async (req
                 age: parseInt(age),
                 identification: cedula || null,
                 createdAt: new Date(), // Base de los indicadores por periodo
-                email,            // Guardamos el correo
+                email: correo,    // Normalizado: sin espacios y en minúsculas
                 accessCode,       // Guardamos la contraseña temporal
                 condition: condition || diagnosis || "No especificada",
                 diagnosis: diagnosis || condition,
@@ -375,7 +400,7 @@ app.post('/api/patients', requireAuth, requireRole('ADMIN', 'SUPER'), async (req
         // nunca en el código.
         const mailOptions = {
             from: `"Elígeme - Cuidado" <${process.env.MAIL_USER}>`,
-            to: email,
+            to: correo,
             subject: "Tu Código de Acceso - Elígeme",
             html: `
                 <div style="font-family: Arial, sans-serif; padding: 20px; color: #333;">
@@ -389,10 +414,28 @@ app.post('/api/patients', requireAuth, requireRole('ADMIN', 'SUPER'), async (req
             `
         };
 
-        await transporter.sendMail(mailOptions);
+        // El paciente YA está en la base. Si el envío falla y dejamos que la
+        // excepción suba, la respuesta es 500: el panel dice "no se pudo
+        // guardar", el admin lo vuelve a crear y quedan filas duplicadas con
+        // códigos distintos. Así aparecieron seis pacientes con el mismo
+        // correo. El fallo del correo se informa, no se disfraza de error de
+        // guardado, y se devuelve el código para entregarlo por otra vía.
+        let correoEnviado = false;
+        try {
+            await transporter.sendMail(mailOptions);
+            correoEnviado = true;
+            console.log(`✅ Paciente creado y correo enviado a: ${correo}`);
+        } catch (errorCorreo) {
+            console.error(`⚠️ Paciente ${newPatient.id} creado, pero el correo a ${correo} falló:`, errorCorreo.message);
+        }
 
-        console.log(`✅ Paciente creado y correo enviado a: ${email}`);
-        res.status(201).json(newPatient);
+        res.status(201).json({
+            ...newPatient,
+            correoEnviado,
+            // Solo cuando el correo no salió: el admin necesita el código para
+            // entregarlo en mano. Si salió, no se expone.
+            codigoParaEntregar: correoEnviado ? undefined : accessCode
+        });
 
     } catch (error) {
         console.error("❌ Error creando paciente:", error);
